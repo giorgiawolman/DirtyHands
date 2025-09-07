@@ -46,7 +46,7 @@ def split_image(image_path, output_dir, tile_size=64, pad=True, pad_value=128):
     print(f"Saved {count} tiles to {output_dir}")
 
 # === Configuration: Hard-coded paths ===
-INPUT_IMAGE = r"C:\Users\Lennart Hamm\Desktop\divers\macad\thesis\DirtyHands\Images\HighRes TrueColor 2018 2m Graz.png"
+INPUT_IMAGE = r"C:\Users\Lennart Hamm\Desktop\divers\macad\thesis\DirtyHands\Images\retz prediction satelite 2021.png"
 OUTPUT_DIR  = r"C:\Users\Lennart Hamm\Desktop\divers\macad\thesis\DirtyHands\Images\ImageSplit"
 
 if __name__ == "__main__":

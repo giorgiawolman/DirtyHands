@@ -37,7 +37,7 @@ WORKFLOW_ID = "workflow"
 USE_CACHE = True  # cache workflow definition 15 minutes on Roboflow
 
 # Input image (single file or folder)
-INPUT_PATH = r"C:\Users\Lennart Hamm\Desktop\divers\macad\thesis\DirtyHands\ForestDetectionImages\HighRes TrueColor 2018 2m Graz - Kopie.png"
+INPUT_PATH = r"C:\Users\Lennart Hamm\Desktop\divers\macad\thesis\DirtyHands\Images\ToBePredicted\graz2018 satelite.png"
 OUTPUT_DIR = r"C:\Users\Lennart Hamm\Desktop\divers\macad\thesis\DirtyHands\GrasshopperOutput"
 
 # If you later want physical units, you can pass pixel size here (unused for export-only).
