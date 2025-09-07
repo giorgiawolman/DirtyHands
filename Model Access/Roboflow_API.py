@@ -1,61 +1,329 @@
 # gh_export_instances_workflow.py
-# Calls a Roboflow WORKFLOW via Serverless Hosted API (V2),
-# then exports polygons to DXF + a GH-friendly CSV.
-# Modes: "live" (workflow), "mock" (no network), "fixture" (load JSON).
+# Run a Roboflow Workflow (serverless V2), optionally merge overlaps,
+# then export polygons to DXF + a CSV for Grasshopper.
 
-import os
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional, Tuple
 import json
 import math
-from pathlib import Path
-from typing import List, Dict, Literal, Optional, Any
 import random
 
 import numpy as np
 import cv2
 
-# Optional: DXF export (install once if you want DXF: pip install ezdxf)
+# Optional: DXF (pip install ezdxf)
 try:
     import ezdxf
     HAS_EZDXF = True
 except Exception:
     HAS_EZDXF = False
 
-# -------------------------------
-# CONFIG — choose test mode
-# -------------------------------
-TEST_MODE: Literal["live", "mock", "fixture"] = "live"
-# "live"    -> call Roboflow workflow normally
-# "mock"    -> generate fake predictions (no network needed)
-# "fixture" -> load predictions from a saved JSON file below
+# Optional: polygon ops (pip install shapely)
+try:
+    from shapely.geometry import Polygon, MultiPolygon
+    from shapely.ops import unary_union
+    HAS_SHAPELY = True
+except Exception:
+    HAS_SHAPELY = False
 
-FIXTURE_JSON = r"C:\path\to\saved_prediction.json"  # used if TEST_MODE=="fixture"
-
-# ---- Roboflow WORKFLOW access (values you provided) ----
-API_KEY = "Sp3ArhygLcCOlxn6UV4P"
-WORKSPACE_NAME = "forest-cover-changes"
-WORKFLOW_ID = "workflow"
-USE_CACHE = True  # cache workflow definition 15 minutes on Roboflow
-
-# Input image (single file or folder)
-INPUT_PATH = r"C:\Users\Lennart Hamm\Desktop\divers\macad\thesis\DirtyHands\Images\ToBePredicted\graz2018 satelite.png"
-OUTPUT_DIR = r"C:\Users\Lennart Hamm\Desktop\divers\macad\thesis\DirtyHands\GrasshopperOutput"
-
-# If you later want physical units, you can pass pixel size here (unused for export-only).
-PIXEL_SIZE_MM = None
-# -------------------------------
-
-# --- Roboflow client (LIVE mode uses V2 endpoint) ---
+# Roboflow client
 from inference_sdk import InferenceHTTPClient
 
-def make_live_client():
-    return InferenceHTTPClient(
-        api_url="https://serverless.roboflow.com",
-        api_key=API_KEY
-    )
 
-# ---------- MOCK / FIXTURE HELPERS ----------
-def make_mock_predictions(w: int, h: int) -> Dict:
-    """Return a Roboflow-like predictions dict with 2 polygons."""
+# ──────────────────────────────────────────────────────────────────────────────
+# CONFIG — EDIT THESE
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Mode
+TEST_MODE: Literal["live", "mock", "fixture"] = "live"
+FIXTURE_JSON = r"C:\path\to\saved_prediction.json"  # used if TEST_MODE=="fixture"
+
+# Roboflow
+API_KEY        = "Sp3ArhygLcCOlxn6UV4P"
+WORKSPACE_NAME = "forest-cover-changes"
+WORKFLOW_ID    = "workflow"
+USE_CACHE      = True
+
+# IO
+INPUT_PATH  = r"C:\Users\Lennart Hamm\Desktop\divers\macad\thesis\DirtyHands\Images\ToBePredicted\leibintz2018 satelite.png"
+OUTPUT_DIR  = r"C:\Users\Lennart Hamm\Desktop\divers\macad\thesis\DirtyHands\GrasshopperOutput"
+
+# Canvas/Image size handling
+ORIGINAL_IMAGE_SIZE: Tuple[int, int] = (1280, 1280)   # (width, height)
+FORCE_RESCALE_FROM_JSON_SIZE: bool = False           # set True if JSON reports a different canvas
+
+# Coordinates
+FLIP_Y_FOR_CAD: bool = True                         # y' = H - y
+
+# DXF
+EXPORT_ID_TEXT_IN_DXF: bool = False                 # set True to place tiny id labels
+
+# Merge overlaps (requires shapely): "none" | "per_class" | "all"
+MERGE_OVERLAPS: Literal["none", "per_class", "all"] = "per_class"
+MERGE_BUFFER_EPS: float = 0.1                        # small cleanup buffer; 0.0 to disable
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLIENT / IO
+# ──────────────────────────────────────────────────────────────────────────────
+
+def rf_client() -> InferenceHTTPClient:
+    return InferenceHTTPClient(api_url="https://serverless.roboflow.com", api_key=API_KEY)
+
+def load_fixture(path: str) -> Dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def call_workflow(image_path: str) -> Dict:
+    if TEST_MODE == "fixture":
+        return load_fixture(FIXTURE_JSON)
+
+    if TEST_MODE == "mock":
+        img = cv2.imread(image_path)
+        h, w = (480, 640) if img is None else img.shape[:2]
+        return make_mock(w, h)
+
+    # live
+    client = rf_client()
+    res = client.run_workflow(
+        workspace_name=WORKSPACE_NAME,
+        workflow_id=WORKFLOW_ID,
+        images={"image": image_path},
+        use_cache=USE_CACHE
+    )
+    return normalize_result(res)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PREDICTIONS — FIND, SCALE, FLIP, MERGE
+# ──────────────────────────────────────────────────────────────────────────────
+
+def normalize_result(res: Any) -> Dict:
+    if isinstance(res, dict) and isinstance(res.get("predictions"), list):
+        return res
+    preds = find_polys(res)
+    out = {"predictions": preds}
+    w, h = find_image_size(res)
+    if w and h:
+        out["image"] = {"width": int(w), "height": int(h)}
+    return out
+
+def find_polys(obj: Any) -> List[Dict]:
+    found: List[Dict] = []
+    def rec(o: Any):
+        if isinstance(o, dict):
+            if isinstance(o.get("points"), list):
+                found.append(o)
+            if isinstance(o.get("predictions"), list):
+                lst = o["predictions"]
+                if lst and isinstance(lst[0], dict) and isinstance(lst[0].get("points"), list):
+                    found.extend(lst)
+            for v in o.values(): rec(v)
+        elif isinstance(o, list):
+            for it in o: rec(it)
+    rec(obj)
+    return [p for p in found if isinstance(p.get("points"), list)]
+
+def find_image_size(obj: Any) -> Tuple[Optional[int], Optional[int]]:
+    w = h = None
+    def rec(o: Any):
+        nonlocal w, h
+        if w and h: return
+        if isinstance(o, dict):
+            if isinstance(o.get("image"), dict):
+                iw = o["image"].get("width"); ih = o["image"].get("height")
+                if iw is not None and ih is not None:
+                    w, h = iw, ih; return
+            for v in o.values(): rec(v)
+        elif isinstance(o, list):
+            for it in o: rec(it)
+    rec(obj)
+    return w, h
+
+def bbox_max(preds: List[Dict]) -> Tuple[float, float]:
+    mx = my = 0.0
+    for p in preds:
+        for pt in p.get("points", []):
+            x = float(pt.get("x", 0.0)); y = float(pt.get("y", 0.0))
+            mx = max(mx, x); my = max(my, y)
+    return mx, my
+
+def scale_to_image(preds: List[Dict],
+                   target_wh: Tuple[int, int],
+                   json_wh: Optional[Tuple[int, int]],
+                   force_from_json: bool) -> List[Dict]:
+    if not preds:
+        return preds
+    W, H = target_wh
+    xmax, ymax = bbox_max(preds)
+    eps = 1e-6
+
+    # normalized → scale
+    if xmax <= 1.0 + eps and ymax <= 1.0 + eps:
+        sx, sy = float(W), float(H)
+        out = []
+        for p in preds:
+            q = dict(p)
+            q["points"] = [{"x": float(pt["x"]) * sx, "y": float(pt["y"]) * sy} for pt in p["points"]]
+            out.append(q)
+        print(f"  • scaled normalized coords → {W}x{H}")
+        return out
+
+    # canvas → target
+    if force_from_json and json_wh and json_wh != (W, H):
+        jW, jH = json_wh
+        if jW and jH:
+            sx, sy = float(W) / float(jW), float(H) / float(jH)
+            out = []
+            for p in preds:
+                q = dict(p)
+                q["points"] = [{"x": float(pt["x"]) * sx, "y": float(pt["y"]) * sy} for pt in p["points"]]
+                out.append(q)
+            print(f"  • rescaled {jW}x{jH} → {W}x{H} (sx={sx:.6f}, sy={sy:.6f})")
+            return out
+
+    print("  • using polygon coords as-is")
+    return preds
+
+def flip_y(preds: List[Dict], image_h: int) -> List[Dict]:
+    if not preds: return preds
+    H = float(image_h)
+    out: List[Dict] = []
+    for p in preds:
+        q = dict(p)
+        q["points"] = [{"x": float(pt["x"]), "y": H - float(pt["y"])} for pt in p["points"]]
+        out.append(q)
+    return out
+
+# ── merging (Shapely) ─────────────────────────────────────────────────────────
+
+def pred_to_poly(p: Dict) -> Optional[Polygon]:
+    pts = p.get("points") or []
+    if len(pts) < 3:
+        return None
+    ring = [(float(pt["x"]), float(pt["y"])) for pt in pts]
+    if ring[0] != ring[-1]:
+        ring.append(ring[0])
+    try:
+        poly = Polygon(ring).buffer(0)  # normalize geometry
+        return None if poly.is_empty else poly
+    except Exception:
+        return None
+
+def poly_to_preds(geom, cls: str, conf: float) -> List[Dict]:
+    geoms = list(geom.geoms) if isinstance(geom, MultiPolygon) else [geom]
+    out: List[Dict] = []
+    for g in geoms:
+        ext = g.exterior
+        if not ext: continue
+        pts = [{"x": float(x), "y": float(y)} for x, y in ext.coords]
+        if len(pts) >= 2 and pts[0] == pts[-1]:
+            pts = pts[:-1]
+        if len(pts) >= 3:
+            out.append({"class": cls, "confidence": float(conf), "points": pts})
+    return out
+
+def merge_overlaps(preds: List[Dict], mode: str) -> List[Dict]:
+    if mode == "none" or not preds or not HAS_SHAPELY:
+        if mode != "none" and not HAS_SHAPELY:
+            print("  ! shapely not installed → skipping merge")
+        return preds
+
+    def merge_list(items: List[Dict]) -> List[Dict]:
+        geoms = []
+        confs = []
+        for it in items:
+            g = pred_to_poly(it)
+            if g is None: continue
+            if MERGE_BUFFER_EPS > 0:
+                g = g.buffer(MERGE_BUFFER_EPS)
+            geoms.append(g)
+            confs.append(float(it.get("confidence", 0.0)))
+        if not geoms: return []
+        merged = unary_union(geoms)
+        if MERGE_BUFFER_EPS > 0:
+            merged = merged.buffer(-MERGE_BUFFER_EPS).buffer(0)
+        return poly_to_preds(merged, items[0].get("class", "object"), max(confs) if confs else 0.0)
+
+    if mode == "per_class":
+        by_cls: Dict[str, List[Dict]] = {}
+        for p in preds:
+            by_cls.setdefault(p.get("class", "object"), []).append(p)
+        out: List[Dict] = []
+        for cls, items in by_cls.items():
+            out.extend(merge_list(items))
+        print(f"  • merged overlaps per class → {len(out)} polys")
+        return out
+
+    if mode == "all":
+        out = merge_list(preds)
+        print(f"  • merged overlaps (global) → {len(out)} polys")
+        return out
+
+    return preds
+
+# ──────────────────────────────────────────────────────────────────────────────
+# EXPORTS
+# ──────────────────────────────────────────────────────────────────────────────
+
+def ensure_dirs(base_out: str):
+    Path(base_out).mkdir(parents=True, exist_ok=True)
+    for sub in ("dxf", "json"):
+        Path(base_out, sub).mkdir(parents=True, exist_ok=True)
+
+def export_dxf(preds: List[Dict], dxf_path: Path):
+    if not HAS_EZDXF:
+        print("  (DXF skipped — ezdxf not installed)")
+        return
+
+    doc = ezdxf.new("R2010")
+    msp = doc.modelspace()
+
+    def aci(c):
+        try: return max(1, min(200, int(round(float(c) * 200))))
+        except Exception: return 1
+
+    for i, p in enumerate(preds):
+        pts = p.get("points") or []
+        if len(pts) < 2:
+            continue
+        layer = p.get("class", "object")
+        color = aci(p.get("confidence", 0.0))
+        poly = [(float(pt["x"]), float(pt["y"])) for pt in pts]
+        if poly[0] != poly[-1]:
+            poly.append(poly[0])
+        if layer not in doc.layers:
+            doc.layers.add(layer)
+        msp.add_lwpolyline(poly, dxfattribs={"layer": layer, "color": color})
+
+        if EXPORT_ID_TEXT_IN_DXF:
+            body = poly[:-1] if len(poly) > 1 and poly[0] == poly[-1] else poly
+            cx = float(np.mean([x for x, _ in body])); cy = float(np.mean([y for _, y in body]))
+            text = msp.add_text(f"id:{i}", dxfattribs={"height": 3.0, "layer": layer, "color": color})
+            try: text.set_pos((cx, cy))
+            except AttributeError: text.dxf.insert = (cx, cy)
+
+    doc.saveas(str(dxf_path))
+
+def rows_for_csv(image_name: str, preds: List[Dict]) -> List[Dict]:
+    rows = []
+    for i, p in enumerate(preds):
+        pts = p.get("points") or []
+        if not pts: continue
+        rows.append({
+            "image": image_name,
+            "instance_id": i,
+            "class": p.get("class", "object"),
+            "confidence": float(p.get("confidence", 0.0)),
+            "num_vertices": len(pts),
+            "centroid_x": sum(pt["x"] for pt in pts) / len(pts),
+            "centroid_y": sum(pt["y"] for pt in pts) / len(pts),
+        })
+    return rows
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MOCK (for TEST_MODE="mock")
+# ──────────────────────────────────────────────────────────────────────────────
+
+def make_mock(w: int, h: int) -> Dict:
     random.seed(42)
     def poly(cx, cy, r, n=16):
         pts = []
@@ -67,207 +335,18 @@ def make_mock_predictions(w: int, h: int) -> Dict:
             y = max(0, min(h - 1, cy + ry * math.sin(ang)))
             pts.append({"x": float(x), "y": float(y)})
         return pts
-
     return {
         "predictions": [
-            {
-                "class": "object_a",
-                "confidence": 0.93,
-                "x": w * 0.30, "y": h * 0.40, "width": 120, "height": 100,
-                "points": poly(w * 0.30, h * 0.40, min(w, h) * 0.12)
-            },
-            {
-                "class": "object_b",
-                "confidence": 0.88,
-                "x": w * 0.65, "y": h * 0.55, "width": 140, "height": 130,
-                "points": poly(w * 0.65, h * 0.55, min(w, h) * 0.15)
-            }
+            {"class": "a", "confidence": 0.9, "points": poly(w*0.30, h*0.40, min(w, h)*0.12)},
+            {"class": "b", "confidence": 0.8, "points": poly(w*0.65, h*0.55, min(w, h)*0.15)},
         ],
         "image": {"width": int(w), "height": int(h)}
     }
 
-def load_fixture_predictions(json_path: str) -> Dict:
-    with open(json_path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-# --- inference dispatcher + prediction extraction ---
-def call_inference(image_path: str) -> Dict:
-    """Returns a dict with at least a 'predictions' list + optional 'image' size."""
-    if TEST_MODE == "mock":
-        img_bgr = cv2.imread(image_path)
-        if img_bgr is None:
-            return make_mock_predictions(640, 480)
-        h, w = img_bgr.shape[:2]
-        return make_mock_predictions(w, h)
-
-    if TEST_MODE == "fixture":
-        return load_fixture_predictions(FIXTURE_JSON)
-
-    # live mode (workflow)
-    client = make_live_client()
-    res = client.run_workflow(
-        workspace_name=WORKSPACE_NAME,
-        workflow_id=WORKFLOW_ID,
-        images={"image": image_path},
-        use_cache=USE_CACHE
-    )
-
-    # Try to normalize various possible workflow outputs into {"predictions":[...], "image":{...}}
-    normalized = normalize_workflow_result(res)
-    return normalized
-
-def normalize_workflow_result(res: Any) -> Dict:
-    """
-    Tries to find a list of instance-segmentation predictions with 'points' in a workflow result.
-    Returns {"predictions": [...], "image": {...}}.
-    """
-    # Fast path: already in expected format
-    if isinstance(res, dict) and "predictions" in res and isinstance(res["predictions"], list):
-        return res
-
-    # Common workflow shapes: nestings under 'results', 'steps', etc.
-    # We'll scan the dict recursively for a list of dicts that look like predictions with 'points'.
-    preds = find_predictions_with_points(res)
-    out = {"predictions": preds}
-    # Try to attach image size if present anywhere
-    w, h = find_image_size(res)
-    if w and h:
-        out["image"] = {"width": int(w), "height": int(h)}
-    return out
-
-def find_predictions_with_points(obj: Any) -> List[Dict]:
-    found = []
-    def rec(o):
-        nonlocal found
-        if isinstance(o, dict):
-            # If this dict looks like ONE prediction with points
-            if "points" in o and isinstance(o["points"], list):
-                # Wrap as list if we accidentally hit a single prediction
-                found.append(o)
-            # If we see a list under 'predictions', extend
-            if "predictions" in o and isinstance(o["predictions"], list):
-                if o["predictions"] and isinstance(o["predictions"][0], dict) and "points" in o["predictions"][0]:
-                    found.extend(o["predictions"])
-            for v in o.values():
-                rec(v)
-        elif isinstance(o, list):
-            for it in o:
-                rec(it)
-    rec(obj)
-
-    # If we accidentally appended single predictions individually, make sure structure is a flat list of dicts
-    # and filter to unique objects by id if present
-    if not found:
-        return []
-    # Keep only dicts that have 'points' (and are polygons)
-    found = [p for p in found if isinstance(p, dict) and isinstance(p.get("points"), list)]
-    return found
-
-def find_image_size(obj: Any) -> (Optional[int], Optional[int]):
-    w = h = None
-    def rec(o):
-        nonlocal w, h
-        if w and h:
-            return
-        if isinstance(o, dict):
-            if "image" in o and isinstance(o["image"], dict):
-                iw, ih = o["image"].get("width"), o["image"].get("height")
-                if iw and ih:
-                    w, h = iw, ih
-                    return
-            # sometimes under 'metadata' or similar
-            for k, v in o.items():
-                rec(v)
-        elif isinstance(o, list):
-            for it in o:
-                rec(it)
-    rec(obj)
-    return w, h
-
-# -------------------------------
-# EXPORTS FOR GRASSHOPPER
-# -------------------------------
-def ensure_dirs(base_out: str):
-    Path(base_out).mkdir(parents=True, exist_ok=True)
-    Path(base_out, "dxf").mkdir(parents=True, exist_ok=True)
-    Path(base_out, "json").mkdir(parents=True, exist_ok=True)
-
-def export_dxf_for_gh(preds: List[Dict], dxf_path: Path):
-    """
-    Writes a DXF with:
-      - One closed LWPOLYLINE per instance
-      - Layer = class
-      - Color mapped by confidence (optional)
-      - Tiny text label 'id:<i>' at centroid (for joining in GH)
-    """
-    if not HAS_EZDXF:
-        print("  (DXF skipped – ezdxf not installed)")
-        return
-
-    doc = ezdxf.new("R2010")
-    msp = doc.modelspace()
-
-    def color_from_conf(c):
-        # map 0..1 → 1..200 (ACI)
-        return max(1, min(200, int(round(float(c) * 200))))
-
-    for i, pred in enumerate(preds):
-        pts = pred.get("points", [])
-        if not pts:
-            continue
-        cls = pred.get("class", "object")
-        conf = float(pred.get("confidence", 0.0))
-
-        poly_xy = np.array([[p["x"], p["y"]] for p in pts], dtype=float)
-        poly_list = [(float(x), float(y)) for x, y in poly_xy]
-        if poly_list[0] != poly_list[-1]:
-            poly_list.append(poly_list[0])
-
-        # ensure layer exists
-        if cls not in doc.layers:
-            doc.layers.add(cls)
-
-        # add polyline
-        msp.add_lwpolyline(
-            poly_list,
-            dxfattribs={"layer": cls, "color": color_from_conf(conf)}
-        )
-
-        # add centroid text label; use insert attribute for maximum compatibility
-        cx = float(np.mean(poly_xy[:, 0]))
-        cy = float(np.mean(poly_xy[:, 1]))
-        text = msp.add_text(
-            f"id:{i}",
-            dxfattribs={"height": 3.0, "layer": cls, "color": color_from_conf(conf)}
-        )
-        # place the text (older ezdxf versions don’t have set_pos)
-        try:
-            text.set_pos((cx, cy))
-        except AttributeError:
-            text.dxf.insert = (cx, cy)
-
-    doc.saveas(str(dxf_path))
-
-def rows_from_preds(image_name: str, preds: List[Dict]) -> List[Dict]:
-    rows = []
-    for i, p in enumerate(preds):
-        pts = p.get("points", [])
-        if not pts:
-            continue
-        rows.append({
-            "image": image_name,
-            "instance_id": i,                       # matches DXF id:<i>
-            "class": p.get("class", "object"),
-            "confidence": float(p.get("confidence", 0.0)),
-            "num_vertices": len(pts),
-            "centroid_x": sum(pt["x"] for pt in pts) / len(pts),
-            "centroid_y": sum(pt["y"] for pt in pts) / len(pts),
-        })
-    return rows
-
-# -------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # MAIN
-# -------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+
 def main():
     ensure_dirs(OUTPUT_DIR)
 
@@ -276,53 +355,68 @@ def main():
         print(f"Input not found: {in_path}")
         return
 
-    # Process single image or folder
-    if in_path.is_file():
-        images = [in_path]
-    else:
-        exts = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
-        images = [p for p in sorted(in_path.glob("*")) if p.suffix.lower() in exts]
-
+    images = [in_path] if in_path.is_file() else [
+        p for p in sorted(in_path.glob("*")) if p.suffix.lower() in {".jpg",".jpeg",".png",".tif",".tiff",".bmp",".webp"}
+    ]
     if not images:
         print("No images to process.")
         return
 
-    # Prepare CSV once
     csv_path = Path(OUTPUT_DIR, "gh_metrics.csv")
     write_header = not csv_path.exists()
 
     for img_path in images:
         print(f"\nProcessing: {img_path.name}")
-        result = call_inference(str(img_path))
-        preds = result.get("predictions", [])
+        result = call_workflow(str(img_path))
 
-        # Save raw JSON for reference/debug
-        json_path = Path(OUTPUT_DIR, "json", f"{img_path.stem}.json")
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(result, f, indent=2)
+        preds: List[Dict] = result.get("predictions", []) or []
+        js_img = result.get("image") if isinstance(result.get("image"), dict) else {}
+        json_wh = None
+        if isinstance(js_img.get("width"), (int, float)) and isinstance(js_img.get("height"), (int, float)):
+            json_wh = (int(js_img["width"]), int(js_img["height"]))
 
-        # DXF export
+        # scale / flip
+        preds = scale_to_image(preds, ORIGINAL_IMAGE_SIZE, json_wh, FORCE_RESCALE_FROM_JSON_SIZE)
+        if FLIP_Y_FOR_CAD:
+            preds = flip_y(preds, ORIGINAL_IMAGE_SIZE[1])
+            print(f"  • y-flip → H={ORIGINAL_IMAGE_SIZE[1]}")
+
+        # merge overlaps
+        if MERGE_OVERLAPS != "none":
+            preds_before = len(preds)
+            preds = merge_overlaps(preds, MERGE_OVERLAPS)
+            print(f"  • merge: {preds_before} → {len(preds)}")
+
+        # save processed JSON
+        out_json = Path(OUTPUT_DIR, "json", f"{img_path.stem}.json")
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump({
+                "predictions": preds,
+                "image": {"width": ORIGINAL_IMAGE_SIZE[0], "height": ORIGINAL_IMAGE_SIZE[1]},
+                "y_flipped": FLIP_Y_FOR_CAD,
+                "merged": MERGE_OVERLAPS,
+                "merge_buffer_eps": MERGE_BUFFER_EPS
+            }, f, indent=2)
+        print(f"  • saved JSON → {out_json.name}")
+
+        # DXF
         dxf_path = Path(OUTPUT_DIR, "dxf", f"{img_path.stem}.dxf")
-        export_dxf_for_gh(preds, dxf_path)
+        export_dxf(preds, dxf_path)
         if HAS_EZDXF:
-            print(f"  ✓ DXF: {dxf_path.name}")
+            print(f"  ✓ DXF → {dxf_path.name}")
 
-        # Append CSV rows
-        rows = rows_from_preds(img_path.name, preds)
+        # CSV
+        rows = rows_for_csv(img_path.name, preds)
         if rows:
             import csv
             with open(csv_path, "a", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=[
-                    "image", "instance_id", "class", "confidence",
-                    "num_vertices", "centroid_x", "centroid_y"
+                    "image","instance_id","class","confidence","num_vertices","centroid_x","centroid_y"
                 ])
                 if write_header:
-                    w.writeheader()
-                    write_header = False
+                    w.writeheader(); write_header = False
                 w.writerows(rows)
-            print(f"  ✓ CSV rows appended: {len(rows)} → {csv_path.name}")
-        else:
-            print("  ! No predictions returned for this image")
+            print(f"  ✓ CSV rows: {len(rows)}")
 
     print("\nDone.")
 
