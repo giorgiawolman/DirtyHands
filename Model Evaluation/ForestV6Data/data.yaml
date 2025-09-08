@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 2
+names: ['forest', 'forestfragmentation']
+
+roboflow:
+  workspace: forest-cover-changes
+  project: forest-change-detection-v2-5wkj2
+  version: 6
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/forest-cover-changes/forest-change-detection-v2-5wkj2/dataset/6

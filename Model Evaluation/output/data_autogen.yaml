@@ -1,0 +1,7 @@
+train: C:\Users\Lennart Hamm\Desktop\divers\macad\thesis\DirtyHands\Model Evaluation\ForestV6Data\train\images
+val: C:\Users\Lennart Hamm\Desktop\divers\macad\thesis\DirtyHands\Model Evaluation\ForestV6Data\valid\images
+names:
+- forest
+- forestfragmentation
+nc: 2
+test: C:\Users\Lennart Hamm\Desktop\divers\macad\thesis\DirtyHands\Model Evaluation\ForestV6Data\test\images
